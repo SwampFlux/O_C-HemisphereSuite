@@ -30,15 +30,6 @@
 #include "OC_ui.h"
 #include "HSApplication.h"
 
-/* Define the screen boundaries. There's a frame around the screen,
-*  so these numbers need to take that into account.
- */
-#define BOUNDARY_TOP 11
-#define BOUNDARY_BOTTOM 61
-#define BOUNDARY_RIGHT 116
-#define BOUNDARY_LEFT 2
-#define Y_CENTER 38
-
 /* Define player properties. INITIAL_BALL_DELAY is how many ISR cycles the ball takes to move. It
  * gets faster as the game goes on. PADDLE_DELAY is how many ISR cycles the player must wait before moving
  * again. This is to keep the game interesting at higher levels. PADDLE_WIDTH is the chunkiness of the paddle,
@@ -46,69 +37,89 @@
  *
  * Note: Each ISR cycle is about 60 microseconds.
  */
-#define INITIAL_BALL_DELAY 200
+#define INITIAL_BALL_DELAY 20
 #define PADDLE_DELAY 200
 #define PADDLE_WIDTH 3
+#define PADDLE_HEIGHT 16
+#define BALL_WIDTH 2
+#define BACK_CATCH 10
 
-/* This value is used for converting a ball's or paddle's Y position into a pitch value. This number was determined
- * experimentally, since I wasn't sure what the total range for pitch values is.
+// there is more precision on the Y axis to fake various bounce angles
+#define PRECISION_X 4
+#define PRECISION_Y 7
+
+/* This value is used for converting a ball's or paddle's Y position into a pitch value.
+ * This number was determined experimentally, since I wasn't sure what the total range
+ * for pitch values is.
  */
-#define PRECISION 1
 #define Y_POSITION_COEFF 128
 
 /*
- * When checking the ADC, if I just look for whether the value is positive or negative, then the value can't be
- * zeroed, and the player can't move the paddle with the onboard controls. This is probably because there's a little
- * noise that randomly swirls around 0. So this value simulates a center detent. This is another experimentally-
- * determined value.
+ * When checking the ADC, if I just look for whether the value is positive or negative,
+ * then the value can't be zeroed, and the player can't move the paddle with the onboard controls.
+ * This is probably because there's a little noise that randomly swirls around 0.
+ * So this value simulates a center detent. This is another experimentally-determined value.
  */
 #define CENTER_DETENT 640
 
 // Length of audio bloops upon bounce
 #define BLOOP_LENGTH 1000 // 17 * 100ms
-#define BLOOP_LOW 0x8
-#define BLOOP_HIGH 0x4
+#define BLOOP_PADDLE 0x8
+#define BLOOP_WALL 0x16
+#define BLOOP_SCORE 0x4
 
-enum playerModeOption {
-    NONE,
-    HUMAN,
-    CPU
+enum inputMode {
+    ANALOG_INPUT_MODE,
+    DIGITAL_INPUT_MODE,
+    CPU_INPUT_MODE
 };
 
 struct Player {
-    int score; // The number of hits in this game
+    bool enabled = true;
+    int score;
     int y_position;
-    playerModeOption player_mode = HUMAN;
-    int paddle_x = 8;
-    int paddle_y = 1 + BOUNDARY_TOP;
-    int paddle_h = 16;
+    inputMode input_mode = ANALOG_INPUT_MODE;
+    int paddle_x;
+    int paddle_y = (32 - (PADDLE_HEIGHT>>1))<<PRECISION_Y;
     int movement_countdown = 0; // Used to limit the speed
+    int paddle_speed = 0;
+    static constexpr int BOUNDS_T = 11 << PRECISION_Y;
+    static constexpr int BOUNDS_B = 61 << PRECISION_Y;
+    static constexpr int PADDLE_RANGE = (BOUNDS_B - BOUNDS_T - (PADDLE_HEIGHT<<PRECISION_Y));
+    static constexpr int Y_CENTER = (BOUNDS_T + BOUNDS_B)>>1;
 
-    void MovePaddleUp() {
+    void movePaddleUp() {
         if (movement_countdown <= 0) {
-            --paddle_y;
-            if (paddle_y < BOUNDARY_TOP) paddle_y = BOUNDARY_TOP;
+            paddle_y -= 1<<PRECISION_Y;
+            if (paddle_y < BOUNDS_T) {
+                paddle_y = BOUNDS_T;
+            }
             movement_countdown = PADDLE_DELAY;
         }
     }
 
-    /* Like MovePaddleUp(), only more down */
-    void MovePaddleDown() {
+    void movePaddleDown() {
         if (movement_countdown <= 0) {
-            ++paddle_y;
-            if (paddle_y > (BOUNDARY_BOTTOM - paddle_h)) paddle_y = BOUNDARY_BOTTOM - paddle_h;
+            paddle_y += 1<<PRECISION_Y;
+            if (paddle_y > BOUNDS_B - (PADDLE_HEIGHT<<PRECISION_Y)) {
+                paddle_y = BOUNDS_B - (PADDLE_HEIGHT<<PRECISION_Y);
+            }
             movement_countdown = PADDLE_DELAY;
         }
     }
 
-    /* Allows the paddle to be moved without an enforced delay, for use with encoder play */
-    void ResetPaddle() {
-        movement_countdown = 0;
+    void handleAnalogInput(int cv){
+        if(input_mode == ANALOG_INPUT_MODE){
+            paddle_y = constrain(
+                HSAPPLICATION_5V - cv,
+                BOUNDS_T,
+                BOUNDS_T + PADDLE_RANGE
+            );
+        }
     }
 
-        /* The player paddle is a filled rectangle of fixed width and adjustable height. */
-    void DrawPaddle() {
-        graphics.drawRect(paddle_x, paddle_y, PADDLE_WIDTH, paddle_h);
+    void drawPaddle() {
+        graphics.drawRect(paddle_x>>PRECISION_X, paddle_y>>PRECISION_Y, PADDLE_WIDTH, PADDLE_HEIGHT);
     }
 
     int getScore() {return score;}
@@ -116,18 +127,24 @@ struct Player {
 
 class Pong : public HSApplication {
 private:
+    int bounces;
     int ball_delay; // The ball's delay at the next movement
     int ball_countdown; // Time (in increments of 60 microseconds) until the ball moves
     int bloop_countdown;
     int bloop_pitch;
     int hi_score; // The highest number of hits in a game since initialization
 
-    // the ball's coordinates have greater precision, half-pixels
-    // bitshift right by 1 for actual pixel position
     int ball_x;
     int ball_y;
     int dir_x;
     int dir_y;
+
+    static constexpr int BOUNDS_T = 11 << PRECISION_Y;
+    static constexpr int BOUNDS_R = 126 << PRECISION_X;
+    static constexpr int BOUNDS_B = 61 << PRECISION_Y;
+    static constexpr int BOUNDS_L = 2 << PRECISION_X;
+    static constexpr int PADDLE_W = PADDLE_WIDTH << PRECISION_X;
+    static constexpr int PADDLE_H = PADDLE_HEIGHT << PRECISION_Y;
 
 public:
     Player player1;
@@ -139,24 +156,32 @@ public:
     void Start() {
         bloop_countdown = 0;
         hi_score = 27;
-        player1.player_mode = HUMAN;
-        player2.player_mode = CPU;
-        player2.paddle_x = 116;
+        player1.input_mode = DIGITAL_INPUT_MODE;
+        player2.input_mode = DIGITAL_INPUT_MODE;
+        player1.paddle_x = BOUNDS_L + (6<<PRECISION_X);
+        player2.paddle_x = BOUNDS_R - (6<<PRECISION_X) - (PADDLE_WIDTH<<PRECISION_X);
 
         StartNewGame();
     }
     void Resume() { }
 
     void ServeBall() {
+        bounces = 0;
         // Game state
         ball_delay = INITIAL_BALL_DELAY;
         ball_countdown = ball_delay;
 
         // Ball properties
-        ball_x = 64;
-        ball_y = random((BOUNDARY_TOP + 2)*2, (BOUNDARY_BOTTOM - 2)*2); // Start off in a random spot
+        ball_x = 64<<PRECISION_X;
+        ball_y = 32<<PRECISION_Y;
         dir_x = 1;
-        dir_y = random(0, 100) > 50 ? 1 : -1; // Start off in a random direction
+        dir_y = 0;
+
+        bloop_countdown = BLOOP_LENGTH;
+        bloop_pitch = BLOOP_SCORE;
+        // ball_y = random((BOUNDARY_TOP + 2)*2, (BOUNDARY_BOTTM - 2)*2); // Start off in a random spot
+        // dir_x = random(0, 100) > 50 ? 1 : -1;
+        //dir_y = random(0, 100) > 50 ? 1 : -1;
     }
 
     void StartNewGame() {
@@ -180,31 +205,20 @@ public:
         MoveBall();
 
         // handle direct CV inputs
-        // TODO: eliminate paddle_h
-        int paddle_range = BOUNDARY_BOTTOM - BOUNDARY_TOP - player1.paddle_h;
-
-        player1.paddle_y = constrain(
-            Y_CENTER - (In(0) >> 7) * paddle_range / 64,
-            BOUNDARY_TOP,
-            BOUNDARY_BOTTOM - player1.paddle_h
-        );
-        player2.paddle_y = constrain(
-            Y_CENTER - (In(3) >> 7) * paddle_range / 64,
-            BOUNDARY_TOP,
-            BOUNDARY_BOTTOM - player2.paddle_h
-        );
+        player1.handleAnalogInput(In(0));
+        player2.handleAnalogInput(In(3));
 
         // TODO:find out if i still need NLM / Buchla tweaks????
         // tweak for NLM to center the inputs around 5 octaves (6V on 1.2V/oct)
         //if (NorthernLightModular && p1_cv) p1_cv -= HSAPPLICATION_5V;
         // check the detent again, just for NLM
-        // if (move_cv < -HEMISPHERE_CENTER_DETENT) MovePaddleUp();
-        // if (move_cv > HEMISPHERE_CENTER_DETENT) MovePaddleDown();
+        // if (move_cv < -HEMISPHERE_CENTER_DETENT) movePaddleUp();
+        // if (move_cv > HEMISPHERE_CENTER_DETENT) movePaddleDown();
 
-        if(Gate(0) && !Gate(1)) player1.MovePaddleUp();
-        if(Gate(1) && !Gate(0)) player1.MovePaddleDown();
-        if(Gate(2) && !Gate(3)) player2.MovePaddleUp();
-        if(Gate(3) && !Gate(2)) player2.MovePaddleDown();
+        if(Gate(0) && !Gate(1)) player1.movePaddleUp();
+        if(Gate(1) && !Gate(0)) player1.movePaddleDown();
+        if(Gate(2) && !Gate(3)) player2.movePaddleUp();
+        if(Gate(3) && !Gate(2)) player2.movePaddleDown();
 
         /* Handle output states:
          *
@@ -217,10 +231,10 @@ public:
          */
 
         // Ball position CV (0 to 4-ish volts), based on the top of the ball
-        uint32_t out_C = (((BOUNDARY_BOTTOM << PRECISION) - ball_y) * Y_POSITION_COEFF)/2;
+        uint32_t out_C = 5000 - ball_y;
 
         // Player paddle position CV (0 to 4-ish volts), based on the center of the paddle
-        // uint32_t out_D = ((paddle_y + (paddle_h / 2)) - BOUNDARY_TOP) * Y_POSITION_COEFF;
+        // uint32_t out_D = ((paddle_y + (PADDLE_HEIGHT / 2)) - BOUNDARY_TOP) * Y_POSITION_COEFF;
 
         Out(2, out_C);
         // Out(3, out_D);
@@ -233,6 +247,18 @@ public:
 
     int get_hi_score() {return hi_score;}
 
+    void handlePaddleBounce(int paddle_y) {
+        dir_x = -dir_x;
+        if((ball_y - paddle_y) < (4<<PRECISION_Y)) --dir_y;
+        if((ball_y - paddle_y) >= (12<<PRECISION_Y)) ++dir_y;
+        dir_y = constrain(dir_y,-6,6);
+        bloop_countdown = BLOOP_LENGTH;
+        bloop_pitch = BLOOP_PADDLE;
+        ClockOut(0);
+        // Level up!!
+        if (!(++bounces % 3)) LevelUp();
+    }
+
     void MoveBall() {
         /* MoveBall() is called with each loop cycle. Moving the ball with each loop would make the
          * game unplayable, so movements are delayed with countdowns. ISR() is responsible for decrementing
@@ -244,50 +270,40 @@ public:
             ball_y += dir_y;
 
             // Check the playfield boundaries. Oh, yes, O_C will crash if you go too far out of bounds.
-            if ((ball_y>>1) > BOUNDARY_BOTTOM || (ball_y>>1) < BOUNDARY_TOP) {
+            if (ball_y < BOUNDS_T || ball_y > BOUNDS_B) {
                 dir_y = -dir_y;
                 bloop_countdown = BLOOP_LENGTH;
-                bloop_pitch = BLOOP_HIGH;
+                bloop_pitch = BLOOP_WALL;
                 ClockOut(1);
             }
 
             // Check collision with Player 1
+            
             if (dir_x < 0 &&
-                ((ball_x>>1) <= player1.paddle_x + PADDLE_WIDTH) && ((ball_x>>1) >= player1.paddle_x) &&
-                ((ball_y>>1) <= player1.paddle_y + player1.paddle_h) && ((ball_y>>1) >= player1.paddle_y)) {
-                
-                // If so, bounce the ball, increase the score, and set the hit trigger to fire the reward
-                // CV trigger at the next loop() call.
-                dir_x = -dir_x;
-                bloop_countdown = BLOOP_LENGTH;
-                bloop_pitch = BLOOP_LOW;
-                ClockOut(0);
+                (ball_x <= player1.paddle_x + PADDLE_W) &&
+                (ball_x >= player1.paddle_x) &&
+                (ball_y >= player1.paddle_y) &&
+                (ball_y - BALL_WIDTH <= player1.paddle_y + PADDLE_H)) {
 
-                // Level up!!
-                if (!(player1.score % 5)) LevelUp();
+                handlePaddleBounce(player1.paddle_y);
             }
+            
 
             // Check collision with Player 2
             if (dir_x > 0 &&
-                ((ball_x>>1) <= player2.paddle_x + PADDLE_WIDTH) && ((ball_x>>1) >= player2.paddle_x) &&
-                ((ball_y>>1) <= player2.paddle_y + player2.paddle_h) && ((ball_y>>1) >= player2.paddle_y)) {
+                (ball_x + BALL_WIDTH >= player2.paddle_x) &&
+                (ball_x <= player2.paddle_x) &&
+                (ball_y >= player2.paddle_y) &&
+                (ball_y - BALL_WIDTH <= player2.paddle_y + PADDLE_H)){
 
-                // If so, bounce the ball, increase the score, and set the hit trigger to fire the reward
-                // CV trigger at the next loop() call.
-                dir_x = -dir_x;
-                bloop_countdown = BLOOP_LENGTH;
-                bloop_pitch = BLOOP_LOW;
-                ClockOut(0);
-
-                // Level up!!
-                if (!(player2.score % 5)) LevelUp();
+                handlePaddleBounce(player2.paddle_y);
             }
 
-            if (ball_x < (BOUNDARY_LEFT)<<1) {
+            if (ball_x < BOUNDS_L + (BALL_WIDTH<<PRECISION_X) - (BACK_CATCH<<PRECISION_X)) {
                 player2.score++;
                 ServeBall();
             }
-            if( ball_x > (BOUNDARY_RIGHT)<<1) {
+            if( ball_x > BOUNDS_R + (BACK_CATCH<<PRECISION_X)) {
                 player1.score++;
                 ServeBall();
             }
@@ -305,24 +321,17 @@ public:
         }
     }
 
-    /* Performs the LevelUp. The game is designed to get brutal over time. The paddle gets smaller, the
-     * ball gets faster, and the paddle gets closer to the wall. Fun times!
-     */
+    // Performs the LevelUp. The game is designed to get brutal over time.
     void LevelUp() {
-        // paddle_h--;
-        ball_delay -= 25;
-        // if (paddle_x < 64) level_up_x_advance = 4;
-
-        // Here are some points after which it doesn't get any harder
-        // if (paddle_h < 4) paddle_h = 4;
-        if (ball_delay < 50) ball_delay = 50;
+        --ball_delay;
+        if(ball_delay < 1) ball_delay = 1;
     }
 
     /*
      * The ball is just a little 2x2 square, with ball_x and ball_y describing the upper-left corner.
      */
     void DrawBall() {
-      graphics.drawFrame(ball_x >> 1, ball_y >> 1, 2, 2);
+      graphics.drawFrame(ball_x >> PRECISION_X, ball_y >> PRECISION_Y, BALL_WIDTH, BALL_WIDTH);
     }
 
     /* If the paddle countdown has elapsed, the paddle may move. Whenever the paddle is moved, the downdown begins again
@@ -347,6 +356,22 @@ public:
         gfxPrint(hi_score); // center
         gfxPrint(110,0,p2_score); // right
         
+        // gfxPrint(12,32,"B:");
+        // gfxPrint((ball_y>>PRECISION) - player1.paddle_y);
+        // // gfxPrint(ball_y>>PRECISION);
+        // // gfxPrint(" P:");
+        // // gfxPrint(player1.paddle_y);
+        // gfxPrint(70,32,"D:");
+        // gfxPrint(dir_y);
+        
+        // out_C
+        gfxPrint(70,18,BOUNDS_B - ball_y);
+        
+        // In(0)
+        gfxPrint(12,18,In(0));
+        gfxPrint(12,32,player1.paddle_y);
+
+
 
         DrawGame();
     }
@@ -354,8 +379,8 @@ public:
     void DrawGame() {
         // Game pieces
         DrawBall();
-        player1.DrawPaddle();
-        player2.DrawPaddle();
+        player1.drawPaddle();
+        player2.drawPaddle();
     }
 };
 
@@ -395,8 +420,8 @@ void PONGGAME_menu() {
 void PONGGAME_screensaver() {
     // Game pieces only
     pong_instance.DrawBall();
-    pong_instance.player1.DrawPaddle();
-    pong_instance.player2.DrawPaddle();
+    pong_instance.player1.drawPaddle();
+    pong_instance.player2.drawPaddle();
 }
 
 /* Controlling the game with the buttons is the worst experience ever, so this is really just here
@@ -409,17 +434,19 @@ void PONGGAME_handleButtonEvent(const UI::Event &event) {
     if (UI::EVENT_BUTTON_PRESS == event.type) {
         switch (event.control) {
           case OC::CONTROL_BUTTON_UP:
-                // pong_instance.MovePaddleUp();
-                // pong_instance.ResetPaddle();
+              pong_instance.player1.input_mode = ANALOG_INPUT_MODE;
             break;
 
           case OC::CONTROL_BUTTON_DOWN:
-                // pong_instance.MovePaddleDown();
-                // pong_instance.ResetPaddle();
+               pong_instance.player2.input_mode = ANALOG_INPUT_MODE;
+            break;
+
+          case OC::CONTROL_ENCODER_L:
+            pong_instance.player1.input_mode = DIGITAL_INPUT_MODE;
             break;
 
           case OC::CONTROL_BUTTON_R:
-                // pong_instance.ToggleTwoPlayer();
+               pong_instance.player2.input_mode = DIGITAL_INPUT_MODE;
             break;
         }
     }
@@ -432,13 +459,13 @@ void PONGGAME_handleButtonEvent(const UI::Event &event) {
  * negative when it's turned widdershins. I just wanted to say "widdershins."
  */
 void PONGGAME_handleEncoderEvent(const UI::Event &event) {
-    if (OC::CONTROL_ENCODER_L == event.control) {
-        if (event.value < 0) pong_instance.player1.MovePaddleUp();
-        if (event.value > 0) pong_instance.player1.MovePaddleDown();
+    if (OC::CONTROL_ENCODER_L == event.control && pong_instance.player1.input_mode == DIGITAL_INPUT_MODE) {
+        if (event.value < 0) pong_instance.player1.movePaddleUp();
+        if (event.value > 0) pong_instance.player1.movePaddleDown();
     }
-    if (OC::CONTROL_ENCODER_R == event.control) {
-        if (event.value < 0) pong_instance.player2.MovePaddleDown();
-        if (event.value > 0) pong_instance.player2.MovePaddleUp();
+    if (OC::CONTROL_ENCODER_R == event.control && pong_instance.player2.input_mode == DIGITAL_INPUT_MODE) {
+        if (event.value < 0) pong_instance.player2.movePaddleDown();
+        if (event.value > 0) pong_instance.player2.movePaddleUp();
     }
 }
 
